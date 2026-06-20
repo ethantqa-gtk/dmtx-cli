@@ -6,7 +6,8 @@
 ._*
 
 # Custom folder icons
-Icon
+Icon
+
 
 # Volume root files
 .DocumentRevisions-V100
@@ -158,3 +159,7 @@ DerivedData/
 # Playgrounds
 timeline.xctimeline
 playground.xcworkspace
+
+# Zig
+.zig-cache
+zig-out

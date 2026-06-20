@@ -21,6 +21,12 @@ const c = @cImport({
     @cInclude("stdio.h");
 });
 
+// Windows binary-mode helpers for stdin (prevents 0x1A / \r\n corruption).
+const win = if (builtin.os.tag == .windows) struct {
+    extern fn _setmode(c_int, c_int) c_int;
+    extern fn _fileno(?*c.FILE) c_int;
+} else struct {};
+
 // `stdout`/`stderr` are NOT simple constants on every platform/libc:
 //   - glibc (most Linux): plain extern globals, non-optional - `c.stdout`
 //     works directly.
@@ -50,6 +56,14 @@ fn cStderr() *c.FILE {
     };
 }
 
+fn cStdin() *c.FILE {
+    return switch (builtin.os.tag) {
+        .windows => c.__acrt_iob_func(0),
+        .macos => c.stdin(),
+        else => if (builtin.abi == .musl) c.stdin.? else c.stdin,
+    };
+}
+
 const ExitCode = enum(u8) {
     ok = 0,
     bad_args = 1,
@@ -65,10 +79,114 @@ fn writeAllTo(stream: *c.FILE, bytes: []const u8) void {
     _ = c.fwrite(bytes.ptr, 1, bytes.len, stream);
 }
 
+fn readExact(stream: *c.FILE, buf: []u8) bool {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = c.fread(@ptrCast(&buf[off]), 1, buf.len - off, stream);
+        if (n == 0) return false;
+        off += n;
+    }
+    return true;
+}
+
 fn errPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
     writeAllTo(cStderr(), msg);
+}
+
+/// Decode a single Data Matrix from an encoded image buffer (PNG, JPEG, etc.).
+/// Returns heap-allocated decoded content, or null on failure.
+fn decodeOne(gpa: std.mem.Allocator, img_data: []const u8) ?[]u8 {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+
+    const pixels = stbi.stbi_load_from_memory(
+        @ptrCast(img_data.ptr),
+        @intCast(img_data.len),
+        &width,
+        &height,
+        &channels,
+        3,
+    );
+    if (pixels == null) return null;
+    defer stbi.stbi_image_free(pixels);
+
+    const dmtx_img = dmtx.dmtxImageCreate(pixels, width, height, dmtx.DmtxPack24bppRGB);
+    if (dmtx_img == null) return null;
+    defer {
+        var p = dmtx_img;
+        _ = dmtx.dmtxImageDestroy(&p);
+    }
+
+    const dec = dmtx.dmtxDecodeCreate(dmtx_img, 1);
+    if (dec == null) return null;
+    defer {
+        var p = dec;
+        _ = dmtx.dmtxDecodeDestroy(&p);
+    }
+
+    const region = dmtx.dmtxRegionFindNext(dec, null);
+    if (region == null) return null;
+    defer {
+        var p = region;
+        _ = dmtx.dmtxRegionDestroy(&p);
+    }
+
+    const msg = dmtx.dmtxDecodeMatrixRegion(dec, region, dmtx.DmtxUndefined);
+    if (msg == null) return null;
+    defer {
+        var p = msg;
+        _ = dmtx.dmtxMessageDestroy(&p);
+    }
+
+    const output_len: usize = @intCast(msg.*.outputIdx);
+    const output_ptr: [*]const u8 = @ptrCast(msg.*.output);
+    return gpa.dupe(u8, output_ptr[0..output_len]) catch null;
+}
+
+/// Long-running mode: read length-prefixed image data from stdin,
+/// decode Data Matrix content, write length-prefixed results to stdout.
+fn runListen(gpa: std.mem.Allocator) u8 {
+    if (builtin.os.tag == .windows) {
+        const _O_BINARY = 0x8000;
+        _ = win._setmode(win._fileno(cStdin()), _O_BINARY);
+    }
+
+    const sin = cStdin();
+    const sout = cStdout();
+
+    while (true) {
+        var len_buf: [4]u8 = undefined;
+        if (!readExact(sin, len_buf[0..])) break;
+        const data_len = std.mem.readInt(u32, &len_buf, .little);
+        if (data_len == 0) break;
+
+        const img_data = gpa.alloc(u8, data_len) catch {
+            errPrint("allocation failed\n", .{});
+            return @intFromEnum(ExitCode.bad_args);
+        };
+        defer gpa.free(img_data);
+
+        if (!readExact(sin, img_data)) break;
+
+        const result = decodeOne(gpa, img_data);
+
+        var out_len_buf: [4]u8 = undefined;
+        const out_len: u32 = if (result) |r| @intCast(r.len) else 0;
+        std.mem.writeInt(u32, &out_len_buf, out_len, .little);
+        _ = c.fwrite(&out_len_buf, 1, 4, sout);
+
+        if (result) |r| {
+            _ = c.fwrite(r.ptr, 1, r.len, sout);
+            gpa.free(r);
+        }
+
+        _ = c.fflush(sout);
+    }
+
+    return @intFromEnum(ExitCode.ok);
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -82,10 +200,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     _ = iter.next(); // skip argv[0]
 
-    const path = iter.next() orelse {
-        errPrint("usage: dmtx-cli <image-path>\n", .{});
+    const first_arg = iter.next() orelse {
+        errPrint("usage: dmtx-cli <image-path> | --listen\n", .{});
         return @intFromEnum(ExitCode.bad_args);
     };
+
+    if (std.mem.eql(u8, first_arg, "--listen") or std.mem.eql(u8, first_arg, "-l")) {
+        return runListen(gpa);
+    }
+
+    const path = first_arg;
 
     // Null-terminated path for stb_image's C API.
     var path_buf: [4096]u8 = undefined;
